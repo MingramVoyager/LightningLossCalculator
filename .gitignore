@@ -1,5 +1,6 @@
 # Cached lightning data — can be re-fetched from NCEI SWDI
-data/
+# Leading slash anchors this to the repo root so src/data/ is NOT excluded
+/data/
 
 # Python
 __pycache__/

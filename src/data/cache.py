@@ -1,0 +1,53 @@
+"""
+Local parquet cache for downloaded SWDI lightning data.
+
+Cache files are keyed by year and stored under the /data directory at the
+repo root.  Cached files are excluded from git via .gitignore.
+"""
+
+from pathlib import Path
+
+import pandas as pd
+
+_CACHE_DIR = Path(__file__).resolve().parents[2] / "data"
+
+
+def cache_path(year: int) -> Path:
+    _CACHE_DIR.mkdir(exist_ok=True)
+    return _CACHE_DIR / f"strikes_{year}.parquet"
+
+
+def is_cached(year: int) -> bool:
+    return cache_path(year).exists()
+
+
+def load(year: int) -> pd.DataFrame:
+    p = cache_path(year)
+    if not p.exists():
+        raise FileNotFoundError(f"No cache for {year}")
+    df = pd.read_parquet(p)
+    # Re-attach UTC timezone if stripped during serialisation
+    if "timestamp_utc" in df.columns and df["timestamp_utc"].dt.tz is None:
+        df["timestamp_utc"] = df["timestamp_utc"].dt.tz_localize("UTC")
+    return df
+
+
+def save(year: int, df: pd.DataFrame) -> None:
+    df.to_parquet(cache_path(year), index=False)
+
+
+def delete(year: int) -> None:
+    p = cache_path(year)
+    if p.exists():
+        p.unlink()
+
+
+def cached_years() -> list[int]:
+    _CACHE_DIR.mkdir(exist_ok=True)
+    years = []
+    for p in _CACHE_DIR.glob("strikes_*.parquet"):
+        try:
+            years.append(int(p.stem.split("_")[1]))
+        except (IndexError, ValueError):
+            pass
+    return sorted(years)
