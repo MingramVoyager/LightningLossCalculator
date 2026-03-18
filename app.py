@@ -125,44 +125,30 @@ with tab_data:
                 st.json({k: (str(v)[:200] if isinstance(v, str) else v)
                          for k, v in probe.items() if k != "raw_text"})
 
-            # Station ID lookup result
-            st.subheader("Station ID Lookup")
-            station_id  = probe.get("station_id")
-            station_msg = probe.get("station_msg", "")
-            usaf        = probe.get("usaf")
-            wban        = probe.get("wban")
-            all_cands   = probe.get("all_candidates", [])
-            if all_cands:
-                st.caption(f"All isd-history candidates: `{', '.join(all_cands)}`")
-            if station_id:
-                st.success(f"✅ Using: USAF **{usaf}**  WBAN **{wban}**  →  `{station_id}`")
-                st.caption(station_msg)
-            else:
-                st.error(f"Could not resolve station ID: {station_msg or probe.get('error', 'unknown error')}")
+            # Station info
+            st.subheader("Data Source")
+            st.info(probe.get("station_msg", ""))
 
-            # Data fetch result
-            st.subheader("Test Fetch (July 4–8 2023)")
+            # Fetch result
+            st.subheader("Test Fetch (July 2023)")
             err         = probe.get("error")
             status_code = probe.get("status_code")
             row_count   = probe.get("row_count", 0)
             ts_hours    = probe.get("ts_hours", 0)
             columns     = probe.get("columns", [])
 
-            if err and station_id is None:
-                st.error(err)
-            elif status_code is not None:
-                if err:
-                    st.error(f"HTTP {status_code} — {err}")
-                elif row_count > 0:
-                    st.success(
-                        f"✅ HTTP {status_code} — "
-                        f"**{row_count:,}** hourly observations, "
-                        f"**{ts_hours}** thunderstorm hours detected."
-                    )
-                    st.write(f"Columns: `{columns[:10]}{'…' if len(columns) > 10 else ''}`")
-                else:
-                    st.warning(f"HTTP {status_code} — 0 rows returned. Check the raw response below.")
-                    st.write(f"Columns: `{columns}`")
+            if err:
+                st.error(f"HTTP {status_code} — {err}")
+            elif row_count > 0:
+                st.success(
+                    f"✅ HTTP {status_code} — "
+                    f"**{row_count:,}** METAR observations in July 2023, "
+                    f"**{ts_hours}** with thunderstorm present weather."
+                )
+                st.write(f"Columns: `{columns}`")
+            else:
+                st.warning(f"HTTP {status_code} — 0 rows returned. Check the raw response below.")
+                st.write(f"Columns: `{columns}`")
 
             st.text_area("Raw response (first 2500 chars)", probe.get("raw_text", ""), height=220)
 
