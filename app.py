@@ -97,60 +97,28 @@ tab_data, tab_analysis, tab_cost, tab_roi = st.tabs(
 # ════════════════════════════════════════════════════════════════════════════
 with tab_data:
     st.header("Lightning Data")
-    st.markdown(
-        "Data source: **NOAA NCEI ISD global-hourly** — Pueblo Memorial Airport ASOS "
-        "station (KPUB, ~3 miles from the depot).  When KPUB reports a thunderstorm "
-        "in its present-weather field, lightning is treated as present within both "
-        "shutdown thresholds.  The 30-minute all-clear rule is applied normally.\n\n"
-        "> **Note on precision:** This approach cannot distinguish a storm at 3 miles "
-        "from one at 19 miles — any thunderstorm at the airport triggers a shutdown. "
-        "This is a conservative estimate appropriate for a multi-year trend analysis. "
-        "For exact 15/20-mile radius analysis, Xweather (aerisweather.com) NLDN data "
-        "can be integrated — contact us for setup."
+
+    st.info(
+        "**Before viewing the analysis, data must be fetched and cached.** "
+        "This takes 2–3 minutes and only needs to be done once per session. "
+        "Follow the steps below."
     )
-    st.caption(f"Cache location: `{cache.cache_dir()}`")
 
-    # ── API Diagnostic ────────────────────────────────────────────────────────
-    with st.expander("🔬 API Diagnostic — test connection before fetching"):
-        st.caption(
-            "Fetches 5 days of KPUB ISD data (July 4–8, 2023 — peak CO storm season) "
-            "to confirm the NCEI endpoint is reachable and thunderstorm parsing is working."
-        )
-        if st.button("Run API Test"):
-            with st.spinner("Resolving KPUB station ID from isd-history.csv and probing NCEI ISD…"):
-                probe = isd_client.probe_api()
+    st.subheader("How to get started")
+    st.markdown(
+        "1. **Set the year range** in the sidebar (left). The default covers the last 10 years.\n"
+        "2. **Click ⬇ Fetch / Refresh** below — this downloads historical thunderstorm "
+        "observations from Pueblo Memorial Airport (KPUB) for each selected year.\n"
+        "3. **Click ▶ Run Analysis** once the fetch completes.\n"
+        "4. **Navigate to the other tabs** to view loss hours, cost estimates, and ROI."
+    )
 
-            # Debug: show raw keys so we can confirm the deployed module version
-            with st.expander("Raw probe dict (debug)"):
-                st.json({k: (str(v)[:200] if isinstance(v, str) else v)
-                         for k, v in probe.items() if k != "raw_text"})
-
-            # Station info
-            st.subheader("Data Source")
-            st.info(probe.get("station_msg", ""))
-
-            # Fetch result
-            st.subheader("Test Fetch (July 2023)")
-            err         = probe.get("error")
-            status_code = probe.get("status_code")
-            row_count   = probe.get("row_count", 0)
-            ts_hours    = probe.get("ts_hours", 0)
-            columns     = probe.get("columns", [])
-
-            if err:
-                st.error(f"HTTP {status_code} — {err}")
-            elif row_count > 0:
-                st.success(
-                    f"✅ HTTP {status_code} — "
-                    f"**{row_count:,}** METAR observations in July 2023, "
-                    f"**{ts_hours}** with thunderstorm present weather."
-                )
-                st.write(f"Columns: `{columns}`")
-            else:
-                st.warning(f"HTTP {status_code} — 0 rows returned. Check the raw response below.")
-                st.write(f"Columns: `{columns}`")
-
-            st.text_area("Raw response (first 2500 chars)", probe.get("raw_text", ""), height=220)
+    st.caption(
+        "Data source: Iowa Environmental Mesonet (IEM) ASOS archive — Pueblo Memorial "
+        "Airport (KPUB, ~3 miles from the depot). Thunderstorm observations at KPUB are "
+        "treated as lightning present within both shutdown thresholds. This is a "
+        "conservative estimate suitable for multi-year trend analysis."
+    )
 
     st.divider()
 
