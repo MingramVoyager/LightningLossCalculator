@@ -4,11 +4,10 @@ Lightning Loss Calculator
 Estimates operational downtime and labor costs driven by lightning proximity
 rules at the Pueblo Chemical Depot energetics site.
 
-Data source : NOAA NCEI Severe Weather Data Inventory (SWDI) — NLDN strikes
+Data source : NOAA NCEI ISD global-hourly — KPUB (Pueblo Airport ASOS, ~3 mi from depot)
 Site        : Pueblo Chemical Depot, Pueblo CO  (38.2710°N, 104.3390°W)
 """
 
-import math
 from datetime import date
 
 import pandas as pd
@@ -22,7 +21,7 @@ from src.analysis.shutdown_engine import (
     yearly_summary,
 )
 from src.costs.calculator import DEFAULT_CATEGORIES, cost_breakdown, roi_analysis
-from src.data import cache, ncei_client
+from src.data import cache, isd_client
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -74,10 +73,10 @@ with st.sidebar:
         st.warning("Full shutdown distance should be less than warning distance.")
 
     st.subheader("Site")
-    st.caption(f"Lat {ncei_client.DEPOT_LAT}°N  ·  Lon {ncei_client.DEPOT_LON}°W")
+    st.caption("Lat 38.2710°N  ·  Lon 104.3390°W")
 
     st.divider()
-    st.caption("Data: NOAA NCEI SWDI / Vaisala NLDN")
+    st.caption("Data: NOAA NCEI ISD / KPUB ASOS")
 
 
 # ── Session state defaults ────────────────────────────────────────────────────
@@ -99,48 +98,41 @@ tab_data, tab_analysis, tab_cost, tab_roi = st.tabs(
 with tab_data:
     st.header("Lightning Data")
     st.markdown(
-        "Data is fetched from the **NOAA NCEI Severe Weather Data Inventory (SWDI)** "
-        "which provides cloud-to-ground strike locations from the Vaisala National "
-        "Lightning Detection Network (NLDN).  Downloaded data is cached in the system "
-        "temp directory so repeated runs within the same session are instant."
+        "Data source: **NOAA NCEI ISD global-hourly** — Pueblo Memorial Airport ASOS "
+        "station (KPUB, ~3 miles from the depot).  When KPUB reports a thunderstorm "
+        "in its present-weather field, lightning is treated as present within both "
+        "shutdown thresholds.  The 30-minute all-clear rule is applied normally.\n\n"
+        "> **Note on precision:** This approach cannot distinguish a storm at 3 miles "
+        "from one at 19 miles — any thunderstorm at the airport triggers a shutdown. "
+        "This is a conservative estimate appropriate for a multi-year trend analysis. "
+        "For exact 15/20-mile radius analysis, Xweather (aerisweather.com) NLDN data "
+        "can be integrated — contact us for setup."
     )
     st.caption(f"Cache location: `{cache.cache_dir()}`")
 
     # ── API Diagnostic ────────────────────────────────────────────────────────
     with st.expander("🔬 API Diagnostic — test connection before fetching"):
-        st.markdown(
-            "Tests the **NCEI Access Data Service** (newer endpoint). "
-            "The original SWDI webservice v2 is currently broken on NOAA's side "
-            "(DNS failure for their internal `tomcat01.local` server)."
+        st.caption(
+            "Fetches 5 days of KPUB ISD data (July 4–8, 2023 — peak CO storm season) "
+            "to confirm the NCEI endpoint is reachable and thunderstorm parsing is working."
         )
         if st.button("Run API Test"):
-            with st.spinner("Probing NCEI Access Data Service…"):
-                probe = ncei_client.probe_api()
+            with st.spinner("Probing NCEI ISD for KPUB…"):
+                probe = isd_client.probe_api()
 
-            st.write(f"**URL called:** `{probe['url']}`")
-            st.write(f"**HTTP status:** {probe['status_code']}`")
+            st.write(f"**URL:** `{probe['url']}`")
+            st.write(f"**HTTP status:** `{probe['status_code']}`")
 
             if probe["error"]:
                 st.error(f"Error: {probe['error']}")
-                st.warning(
-                    "If this also fails, the fallback is the **Xweather (AerisWeather) API** "
-                    "which has a free 30-day trial. Register at aerisweather.com and add your "
-                    "Client ID and Secret in the sidebar — support will be added here."
-                )
             else:
-                if probe["row_count"] == 0:
-                    st.warning(
-                        f"API responded OK (HTTP {probe['status_code']}) but returned 0 records. "
-                        "This may mean the dataset name or parameter format needs adjustment — "
-                        "check the raw response below."
-                    )
-                else:
-                    st.success(
-                        f"✅ OK — {probe['row_count']} records returned. "
-                        f"Columns: `{probe['columns']}`"
-                    )
+                st.success(
+                    f"✅ {probe['row_count']} hourly observations — "
+                    f"**{probe['ts_hours']} thunderstorm hours** detected in the test window."
+                )
+                st.write(f"Columns returned: `{probe['columns']}`")
 
-            st.text_area("Raw response (first 2000 chars)", probe["raw_text"], height=220)
+            st.text_area("Raw response (first 2500 chars)", probe["raw_text"], height=220)
 
     st.divider()
 
@@ -174,9 +166,8 @@ with tab_data:
 
             try:
                 status_box.info(f"Fetching {year}…")
-                df_year = ncei_client.fetch_strikes(
+                df_year = isd_client.fetch_strikes(
                     year, year,
-                    radius_miles=float(warn_miles) + 5,
                     progress_callback=_progress,
                 )
                 cache.save(year, df_year)
