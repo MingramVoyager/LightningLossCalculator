@@ -1,0 +1,13 @@
+# Cached lightning data — can be re-fetched from NCEI SWDI
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
