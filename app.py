@@ -120,36 +120,46 @@ with tab_data:
             with st.spinner("Resolving KPUB station ID from isd-history.csv and probing NCEI ISD…"):
                 probe = isd_client.probe_api()
 
+            # Debug: show raw keys so we can confirm the deployed module version
+            with st.expander("Raw probe dict (debug)"):
+                st.json({k: (str(v)[:200] if isinstance(v, str) else v)
+                         for k, v in probe.items() if k != "raw_text"})
+
             # Station ID lookup result
             st.subheader("Station ID Lookup")
-            if probe["station_id"]:
-                st.success(f"✅ Resolved station ID: **{probe['station_id']}**")
-                st.caption(probe["station_msg"])
+            station_id  = probe.get("station_id")
+            station_msg = probe.get("station_msg", "")
+            if station_id:
+                st.success(f"✅ Resolved station ID: **{station_id}**")
+                st.caption(station_msg)
             else:
-                st.error(f"Could not resolve station ID: {probe['station_msg']}")
+                st.error(f"Could not resolve station ID: {station_msg or probe.get('error', 'unknown error')}")
 
             # Data fetch result
             st.subheader("Test Fetch (July 4–8 2023)")
-            if probe["error"] and probe["station_id"] is None:
-                st.error(probe["error"])
-            elif probe["status_code"] is not None:
-                if probe["error"]:
-                    st.error(f"HTTP {probe['status_code']} — {probe['error']}")
-                elif probe["row_count"] > 0:
-                    st.success(
-                        f"✅ HTTP {probe['status_code']} — "
-                        f"**{probe['row_count']:,}** hourly observations, "
-                        f"**{probe['ts_hours']}** thunderstorm hours detected."
-                    )
-                    st.write(f"Columns: `{probe['columns'][:10]}{'…' if len(probe['columns']) > 10 else ''}`")
-                else:
-                    st.warning(
-                        f"HTTP {probe['status_code']} — 0 rows returned. "
-                        "Check the raw response below."
-                    )
-                    st.write(f"Columns: `{probe['columns']}`")
+            err         = probe.get("error")
+            status_code = probe.get("status_code")
+            row_count   = probe.get("row_count", 0)
+            ts_hours    = probe.get("ts_hours", 0)
+            columns     = probe.get("columns", [])
 
-            st.text_area("Raw response (first 2500 chars)", probe["raw_text"], height=220)
+            if err and station_id is None:
+                st.error(err)
+            elif status_code is not None:
+                if err:
+                    st.error(f"HTTP {status_code} — {err}")
+                elif row_count > 0:
+                    st.success(
+                        f"✅ HTTP {status_code} — "
+                        f"**{row_count:,}** hourly observations, "
+                        f"**{ts_hours}** thunderstorm hours detected."
+                    )
+                    st.write(f"Columns: `{columns[:10]}{'…' if len(columns) > 10 else ''}`")
+                else:
+                    st.warning(f"HTTP {status_code} — 0 rows returned. Check the raw response below.")
+                    st.write(f"Columns: `{columns}`")
+
+            st.text_area("Raw response (first 2500 chars)", probe.get("raw_text", ""), height=220)
 
     st.divider()
 
