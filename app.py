@@ -117,38 +117,39 @@ with tab_data:
             "to confirm the NCEI endpoint is reachable and thunderstorm parsing is working."
         )
         if st.button("Run API Test"):
-            with st.spinner("Probing NCEI ISD — trying all station ID candidates…"):
+            with st.spinner("Resolving KPUB station ID from isd-history.csv and probing NCEI ISD…"):
                 probe = isd_client.probe_api()
 
-            # Per-candidate results
-            st.subheader("Station ID Candidates")
-            cand_rows = []
-            for c in probe["candidates"]:
-                cand_rows.append({
-                    "Station ID":   c["station_id"],
-                    "HTTP Status":  c["status_code"],
-                    "Obs Rows":     c["row_count"],
-                    "TS Hours":     c["ts_hours"],
-                    "Error":        c["error"] or "",
-                })
-            st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
-
-            if probe["working_station"]:
-                st.success(
-                    f"✅ Working station ID: **{probe['working_station']}** — "
-                    f"{probe['row_count']} observations, {probe['ts_hours']} thunderstorm hours "
-                    f"in the July 4–8 2023 test window."
-                )
-                st.write(f"Columns: `{probe['columns']}`")
+            # Station ID lookup result
+            st.subheader("Station ID Lookup")
+            if probe["station_id"]:
+                st.success(f"✅ Resolved station ID: **{probe['station_id']}**")
+                st.caption(probe["station_msg"])
             else:
-                st.error(
-                    "No station ID returned data. Check the raw response below and "
-                    "look up the correct USAF+WBAN at "
-                    "ncei.noaa.gov/pub/data/noaa/isd-history.csv (search KPUB)."
-                )
+                st.error(f"Could not resolve station ID: {probe['station_msg']}")
 
-            st.text_area("Raw response from first working candidate (first 2500 chars)",
-                         probe["raw_text"], height=220)
+            # Data fetch result
+            st.subheader("Test Fetch (July 4–8 2023)")
+            if probe["error"] and probe["station_id"] is None:
+                st.error(probe["error"])
+            elif probe["status_code"] is not None:
+                if probe["error"]:
+                    st.error(f"HTTP {probe['status_code']} — {probe['error']}")
+                elif probe["row_count"] > 0:
+                    st.success(
+                        f"✅ HTTP {probe['status_code']} — "
+                        f"**{probe['row_count']:,}** hourly observations, "
+                        f"**{probe['ts_hours']}** thunderstorm hours detected."
+                    )
+                    st.write(f"Columns: `{probe['columns'][:10]}{'…' if len(probe['columns']) > 10 else ''}`")
+                else:
+                    st.warning(
+                        f"HTTP {probe['status_code']} — 0 rows returned. "
+                        "Check the raw response below."
+                    )
+                    st.write(f"Columns: `{probe['columns']}`")
+
+            st.text_area("Raw response (first 2500 chars)", probe["raw_text"], height=220)
 
     st.divider()
 
