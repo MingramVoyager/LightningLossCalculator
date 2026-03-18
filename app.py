@@ -186,12 +186,9 @@ with tab_data:
         errors = []
 
         for yi, year in enumerate(fetch_years):
-            def _progress(chunk, total, _year=year, _yi=yi, _fetch_years=fetch_years):
-                frac = (_yi + (chunk / max(total, 1))) / len(_fetch_years)
-                progress_bar.progress(
-                    min(frac, 1.0),
-                    text=f"Fetching {_year} — chunk {chunk}/{total}…"
-                )
+            def _progress(done, total, _year=year, _yi=yi, _fetch_years=fetch_years):
+                frac = (_yi + (done / max(total, 1))) / len(_fetch_years)
+                progress_bar.progress(min(frac, 1.0), text=f"Fetching {_year}…")
 
             try:
                 status_box.info(f"Fetching {year}…")

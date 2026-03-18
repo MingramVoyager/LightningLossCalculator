@@ -17,33 +17,35 @@ Limitation vs NLDN strike data:
   • Cannot resolve storms at exactly 15-vs-20 miles.
   • Conservative estimate: any thunderstorm at KPUB = shutdown.
 
-Station lookup:
-  Station IDs are resolved from the NCEI ISD history file at startup so
-  we always use the correct USAF+WBAN regardless of format changes.
+Data access:
+  Direct per-station per-year CSV files from NCEI:
+    https://www.ncei.noaa.gov/data/global-hourly/access/{year}/{usaf}-{wban}.csv
 
-Station ID format for NCEI ADS:
-  The global-hourly dataset requires USAF-WBAN with a hyphen, e.g.
-  "724640-23058".  The 11-digit concatenated form (no hyphen) returns
-  HTTP 200 but zero rows.
+  The ADS query API (access/services/data/v1) returns HTTP 200 but zero rows
+  for this station regardless of station ID format — direct file access is
+  the reliable path.
+
+Station ID:
+  Resolved dynamically from isd-history.csv so the correct USAF+WBAN is
+  always used.  Confirmed: KPUB → USAF 724640, WBAN 23058.
 """
 
 import time
-from datetime import date, timedelta
+from datetime import date
 from io import StringIO
 
 import pandas as pd
 import requests
 
-NCEI_ADS_BASE   = "https://www.ncei.noaa.gov/access/services/data/v1"
-ISD_HISTORY_URL = "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
+ISD_HISTORY_URL  = "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
+ISD_DIRECT_BASE  = "https://www.ncei.noaa.gov/data/global-hourly/access"
 
 KPUB_ICAO    = "KPUB"
 KPUB_LAT     = 38.2890
 KPUB_LON     = -104.4970
 KPUB_DIST_MI = 3.0
 
-_CHUNK_DAYS    = 90
-_REQUEST_PAUSE = 0.5
+_REQUEST_PAUSE = 1.0   # seconds between year fetches
 
 
 # ── Station ID lookup ─────────────────────────────────────────────────────────
@@ -51,11 +53,10 @@ _REQUEST_PAUSE = 0.5
 def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
     """
     Look up the NCEI ISD station for an ICAO call sign by fetching
-    isd-history.csv.  Returns (usaf, wban, status_message).
+    isd-history.csv.
 
-    The returned usaf and wban are zero-padded strings (6 and 5 chars).
-    If multiple rows match, the one with the most recent END date is used.
-    If lookup fails, usaf and wban are None.
+    Returns (usaf, wban, status_message).  usaf and wban are zero-padded
+    strings (6 and 5 characters).  On failure, usaf and wban are None.
     """
     try:
         resp = requests.get(ISD_HISTORY_URL, timeout=60)
@@ -68,7 +69,6 @@ def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
     except Exception as exc:
         return None, None, f"Failed to parse ISD history: {exc}"
 
-    # Locate the call-sign column
     call_col = next(
         (c for c in df.columns if c.strip().upper() in ("CALL", "CALL_SIGN", "ICAO")),
         None,
@@ -103,9 +103,9 @@ def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
     return usaf, wban, msg
 
 
-def _station_param(usaf: str, wban: str) -> str:
-    """Format the station ID as required by NCEI ADS: 'USAF-WBAN'."""
-    return f"{usaf}-{wban}"
+def _direct_url(usaf: str, wban: str, year: int) -> str:
+    """URL for the per-station per-year ISD CSV file."""
+    return f"{ISD_DIRECT_BASE}/{year}/{usaf}-{wban}.csv"
 
 
 # ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -122,25 +122,19 @@ def _parse_raw_csv(text: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _fetch_chunk(station_param: str, start: date, end: date) -> pd.DataFrame:
-    params = {
-        "dataset":   "global-hourly",
-        "stations":  station_param,
-        "startDate": start.isoformat(),
-        "endDate":   end.isoformat(),
-        "format":    "csv",
-    }
+def _fetch_year(usaf: str, wban: str, year: int) -> pd.DataFrame:
+    url = _direct_url(usaf, wban, year)
     try:
-        resp = requests.get(NCEI_ADS_BASE, params=params, timeout=60)
+        resp = requests.get(url, timeout=120)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        raise RuntimeError(f"NCEI ISD request failed ({start}–{end}): {exc}") from exc
+        raise RuntimeError(f"ISD fetch failed ({year}): {exc}") from exc
     return _parse_raw_csv(resp.text)
 
 
 # ── Present-weather thunderstorm detection ────────────────────────────────────
 
-_TS_WMO_CODES        = {"17","29","91","92","93","94","95","96","97","98","99"}
+_TS_WMO_CODES        = {"17", "29", "91", "92", "93", "94", "95", "96", "97", "98", "99"}
 _TS_METAR_SUBSTRINGS = ("TS",)
 
 
@@ -164,9 +158,14 @@ def _row_has_thunderstorm(row: pd.Series) -> bool:
 
 
 def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter raw ISD DataFrame to rows that contain a thunderstorm observation.
+    Returns a DataFrame with columns: timestamp_utc, distance_miles.
+    """
     if raw.empty:
         return pd.DataFrame(columns=["timestamp_utc", "distance_miles"])
 
+    # ISD global-hourly CSVs use 'DATE' as the timestamp column
     date_col = next(
         (c for c in raw.columns if c.strip().upper() in ("DATE", "DATETIME", "DATE_TIME", "TIMESTAMP")),
         None,
@@ -193,21 +192,21 @@ def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
 def probe_api() -> dict:
     """
     Step 1: resolve KPUB station ID from isd-history.csv.
-    Step 2: fetch a 5-day July 2023 test window with both ID formats.
+    Step 2: fetch the full 2023 year file using the direct CSV URL.
     Returns full diagnostic info.
     """
     result = {
-        "usaf":         None,
-        "wban":         None,
-        "station_id":   None,   # hyphenated USAF-WBAN
-        "station_msg":  "",
-        "url":          "",
-        "status_code":  None,
-        "raw_text":     "",
-        "columns":      [],
-        "row_count":    0,
-        "ts_hours":     0,
-        "error":        None,
+        "usaf":        None,
+        "wban":        None,
+        "station_id":  None,
+        "station_msg": "",
+        "url":         "",
+        "status_code": None,
+        "raw_text":    "",
+        "columns":     [],
+        "row_count":   0,
+        "ts_hours":    0,
+        "error":       None,
     }
 
     # Step 1 — resolve station ID
@@ -222,22 +221,12 @@ def probe_api() -> dict:
     result["wban"]       = wban
     result["station_id"] = f"{usaf}-{wban}"
 
-    # Step 2 — test fetch with the hyphenated station ID
-    test_start  = date(2023, 7, 4)
-    test_end    = date(2023, 7, 8)
-    station_param = _station_param(usaf, wban)
-    params = {
-        "dataset":   "global-hourly",
-        "stations":  station_param,
-        "startDate": test_start.isoformat(),
-        "endDate":   test_end.isoformat(),
-        "format":    "csv",
-    }
-    req = requests.Request("GET", NCEI_ADS_BASE, params=params).prepare()
-    result["url"] = req.url
+    # Step 2 — fetch full 2023 year file (direct CSV)
+    url = _direct_url(usaf, wban, 2023)
+    result["url"] = url
 
     try:
-        resp = requests.get(NCEI_ADS_BASE, params=params, timeout=30)
+        resp = requests.get(url, timeout=120)
         result["status_code"] = resp.status_code
         result["raw_text"]    = resp.text[:2500]
         resp.raise_for_status()
@@ -246,8 +235,17 @@ def probe_api() -> dict:
         result["columns"]   = list(raw.columns)
         result["row_count"] = len(raw)
 
-        ts = _parse_ts_hours(raw)
-        result["ts_hours"] = len(ts)
+        # Filter to July to find thunderstorm hours
+        if not raw.empty and result["row_count"] > 0:
+            date_col = next(
+                (c for c in raw.columns if c.strip().upper() in ("DATE", "DATETIME")),
+                None,
+            )
+            if date_col:
+                raw[date_col] = pd.to_datetime(raw[date_col], errors="coerce")
+                july = raw[raw[date_col].dt.month == 7]
+                ts = _parse_ts_hours(july)
+                result["ts_hours"] = len(ts)
 
     except Exception as exc:
         result["error"] = str(exc)
@@ -264,33 +262,33 @@ def fetch_strikes(
     progress_callback=None,
 ) -> pd.DataFrame:
     """
-    Fetch KPUB thunderstorm hours for the given year range.
-    Station ID is resolved from isd-history.csv on every call.
+    Fetch KPUB thunderstorm hours for the given year range via direct
+    per-year ISD CSV files.
+
+    Returns DataFrame: timestamp_utc, latitude, longitude, distance_miles
     """
     usaf, wban, msg = lookup_station_id(KPUB_ICAO)
     if usaf is None:
         raise RuntimeError(f"Could not resolve KPUB station ID: {msg}")
 
-    station_param = _station_param(usaf, wban)
-
-    chunks: list[tuple[date, date]] = []
-    current  = date(start_year, 1, 1)
-    end_date = date(end_year, 12, 31)
-    while current <= end_date:
-        chunk_end = min(current + timedelta(days=_CHUNK_DAYS - 1), end_date)
-        chunks.append((current, chunk_end))
-        current = chunk_end + timedelta(days=1)
-
-    total  = len(chunks)
+    years  = list(range(start_year, end_year + 1))
+    total  = len(years)
     frames: list[pd.DataFrame] = []
 
-    for i, (chunk_start, chunk_end) in enumerate(chunks):
+    for i, year in enumerate(years):
         if progress_callback:
             progress_callback(i, total)
-        raw = _fetch_chunk(station_param, chunk_start, chunk_end)
-        ts  = _parse_ts_hours(raw)
+
+        try:
+            raw = _fetch_year(usaf, wban, year)
+        except RuntimeError as exc:
+            # Log but continue — missing a year is better than aborting
+            raise
+
+        ts = _parse_ts_hours(raw)
         if not ts.empty:
             frames.append(ts)
+
         time.sleep(_REQUEST_PAUSE)
 
     if progress_callback:
