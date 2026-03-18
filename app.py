@@ -131,8 +131,11 @@ with tab_data:
             station_msg = probe.get("station_msg", "")
             usaf        = probe.get("usaf")
             wban        = probe.get("wban")
+            all_cands   = probe.get("all_candidates", [])
+            if all_cands:
+                st.caption(f"All isd-history candidates: `{', '.join(all_cands)}`")
             if station_id:
-                st.success(f"✅ Resolved: USAF **{usaf}**  WBAN **{wban}**  →  API param **{station_id}**")
+                st.success(f"✅ Using: USAF **{usaf}**  WBAN **{wban}**  →  `{station_id}`")
                 st.caption(station_msg)
             else:
                 st.error(f"Could not resolve station ID: {station_msg or probe.get('error', 'unknown error')}")

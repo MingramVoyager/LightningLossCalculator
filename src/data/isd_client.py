@@ -50,57 +50,90 @@ _REQUEST_PAUSE = 1.0   # seconds between year fetches
 
 # ── Station ID lookup ─────────────────────────────────────────────────────────
 
-def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
+def lookup_all_candidates(icao: str) -> tuple[list[tuple[str, str]], str]:
     """
-    Look up the NCEI ISD station for an ICAO call sign by fetching
-    isd-history.csv.
+    Return ALL (usaf, wban) pairs from isd-history.csv matching the ICAO
+    call sign, sorted by END date descending (most recent first).
 
-    Returns (usaf, wban, status_message).  usaf and wban are zero-padded
-    strings (6 and 5 characters).  On failure, usaf and wban are None.
+    Returns (candidates_list, status_message).
+    candidates_list is a list of (usaf, wban) tuples; empty on failure.
     """
     try:
         resp = requests.get(ISD_HISTORY_URL, timeout=60)
         resp.raise_for_status()
     except Exception as exc:
-        return None, None, f"Failed to fetch ISD history: {exc}"
+        return [], f"Failed to fetch ISD history: {exc}"
 
     try:
         df = pd.read_csv(StringIO(resp.text), dtype=str)
     except Exception as exc:
-        return None, None, f"Failed to parse ISD history: {exc}"
+        return [], f"Failed to parse ISD history: {exc}"
 
     call_col = next(
         (c for c in df.columns if c.strip().upper() in ("CALL", "CALL_SIGN", "ICAO")),
         None,
     )
     if call_col is None:
-        return None, None, f"No CALL column found. Columns: {list(df.columns)}"
+        return [], f"No CALL column found. Columns: {list(df.columns)}"
 
     df[call_col] = df[call_col].astype(str).str.strip().str.upper()
     match = df[df[call_col] == icao.upper()].copy()
 
     if match.empty:
-        return None, None, f"No ISD station found for ICAO '{icao}'."
+        return [], f"No ISD station found for ICAO '{icao}'."
 
-    # Most-recent END date first
     if "END" in match.columns:
         match["END"] = pd.to_numeric(match["END"], errors="coerce")
         match = match.sort_values("END", ascending=False)
 
-    row = match.iloc[0]
-    try:
-        usaf = str(int(float(row["USAF"]))).zfill(6)
-        wban = str(int(float(row["WBAN"]))).zfill(5)
-    except Exception as exc:
-        return None, None, f"Could not parse USAF/WBAN: {dict(row)} — {exc}"
+    candidates = []
+    for _, row in match.iterrows():
+        try:
+            usaf = str(int(float(row["USAF"]))).zfill(6)
+            wban = str(int(float(row["WBAN"]))).zfill(5)
+            candidates.append((usaf, wban))
+        except Exception:
+            continue
 
-    name = str(row.get("STATION NAME", row.get("STATION_NAME", ""))).strip()
-    lat  = row.get("LAT", "")
-    lon  = row.get("LON", "")
-    end  = row.get("END", "")
-    msg  = (f"{name} | USAF {usaf}  WBAN {wban} | "
-            f"Lat {lat}  Lon {lon} | Active through {end}")
-    return usaf, wban, msg
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for pair in candidates:
+        if pair not in seen:
+            seen.add(pair)
+            unique.append(pair)
+
+    msg = f"Found {len(unique)} candidate(s) for {icao}: " + ", ".join(f"{u}-{w}" for u, w in unique)
+    return unique, msg
+
+
+def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
+    """
+    Find the USAF+WBAN for an ICAO station whose per-year data file
+    actually exists in the NCEI archive.
+
+    Tries all candidates from isd-history.csv in END-date order,
+    performing a HEAD request against the 2023 archive file to confirm
+    existence.  Returns (usaf, wban, message) for the first hit.
+    """
+    candidates, cand_msg = lookup_all_candidates(icao)
+    if not candidates:
+        return None, None, cand_msg
+
+    probe_year = 2023
+    for usaf, wban in candidates:
+        url = _direct_url(usaf, wban, probe_year)
+        try:
+            head = requests.head(url, timeout=15, allow_redirects=True)
+            if head.status_code == 200:
+                return usaf, wban, f"{cand_msg} | Active file: {usaf}-{wban}"
+        except Exception:
+            continue
+
+    # HEAD checks failed — fall back to the most-recent-END candidate
+    usaf, wban = candidates[0]
+    return usaf, wban, (f"{cand_msg} | WARNING: no file confirmed via HEAD; "
+                        f"using most-recent-END candidate {usaf}-{wban}")
 
 
 def _direct_url(usaf: str, wban: str, year: int) -> str:
@@ -209,13 +242,29 @@ def probe_api() -> dict:
         "error":       None,
     }
 
-    # Step 1 — resolve station ID
-    usaf, wban, msg = lookup_station_id(KPUB_ICAO)
-    result["station_msg"] = msg
+    # Step 1 — resolve station ID (tries all isd-history candidates via HEAD)
+    candidates, cand_msg = lookup_all_candidates(KPUB_ICAO)
+    result["station_msg"] = cand_msg
+    result["all_candidates"] = [f"{u}-{w}" for u, w in candidates]
+
+    if not candidates:
+        result["error"] = cand_msg
+        return result
+
+    usaf, wban = None, None
+    for u, w in candidates:
+        url = _direct_url(u, w, 2023)
+        try:
+            head = requests.head(url, timeout=15, allow_redirects=True)
+            if head.status_code == 200:
+                usaf, wban = u, w
+                break
+        except Exception:
+            continue
 
     if usaf is None:
-        result["error"] = msg
-        return result
+        usaf, wban = candidates[0]
+        result["station_msg"] += f" | No confirmed file — falling back to {usaf}-{wban}"
 
     result["usaf"]       = usaf
     result["wban"]       = wban
