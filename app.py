@@ -108,20 +108,39 @@ with tab_data:
 
     # ── API Diagnostic ────────────────────────────────────────────────────────
     with st.expander("🔬 API Diagnostic — test connection before fetching"):
-        st.caption("Makes a small 3-day request to verify the NCEI SWDI API is reachable and returning expected data.")
+        st.markdown(
+            "Tests the **NCEI Access Data Service** (newer endpoint). "
+            "The original SWDI webservice v2 is currently broken on NOAA's side "
+            "(DNS failure for their internal `tomcat01.local` server)."
+        )
         if st.button("Run API Test"):
-            with st.spinner("Probing NCEI SWDI…"):
-                probe = ncei_client.probe_api(days=3)
+            with st.spinner("Probing NCEI Access Data Service…"):
+                probe = ncei_client.probe_api()
 
             st.write(f"**URL called:** `{probe['url']}`")
-            st.write(f"**HTTP status:** {probe['status_code']}")
+            st.write(f"**HTTP status:** {probe['status_code']}`")
 
             if probe["error"]:
                 st.error(f"Error: {probe['error']}")
+                st.warning(
+                    "If this also fails, the fallback is the **Xweather (AerisWeather) API** "
+                    "which has a free 30-day trial. Register at aerisweather.com and add your "
+                    "Client ID and Secret in the sidebar — support will be added here."
+                )
             else:
-                st.success(f"OK — {probe['row_count']} strike records returned, columns: `{probe['columns']}`")
+                if probe["row_count"] == 0:
+                    st.warning(
+                        f"API responded OK (HTTP {probe['status_code']}) but returned 0 records. "
+                        "This may mean the dataset name or parameter format needs adjustment — "
+                        "check the raw response below."
+                    )
+                else:
+                    st.success(
+                        f"✅ OK — {probe['row_count']} records returned. "
+                        f"Columns: `{probe['columns']}`"
+                    )
 
-            st.text_area("Raw response (first 1500 chars)", probe["raw_text"], height=200)
+            st.text_area("Raw response (first 2000 chars)", probe["raw_text"], height=220)
 
     st.divider()
 
