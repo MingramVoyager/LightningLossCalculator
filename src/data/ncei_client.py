@@ -41,8 +41,7 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 def _bbox_for_radius(lat: float, lon: float, radius_miles: float) -> dict:
     """
     Compute a bounding box that fully contains a circle of radius_miles.
-    Returns dict with min/max lat and lon.  We add a 10% margin so edge
-    storms are never clipped before the haversine filter.
+    Adds 10% margin so edge storms are never clipped before the haversine filter.
     """
     margin = radius_miles * 1.10
     dlat = margin / 69.0
@@ -55,15 +54,86 @@ def _bbox_for_radius(lat: float, lon: float, radius_miles: float) -> dict:
     }
 
 
+def probe_api(days: int = 3) -> dict:
+    """
+    Make a small test request and return diagnostic info:
+      status_code, url, raw_text (first 1000 chars), columns (if parsed), error
+    Used by the UI to verify the API is reachable and returning expected data.
+    """
+    bbox = _bbox_for_radius(DEPOT_LAT, DEPOT_LON, 25.0)
+    test_end = date.today().replace(day=1) - timedelta(days=1)          # last day of prev month
+    test_start = test_end - timedelta(days=days - 1)
+
+    params = {
+        "begin": f"{test_start.isoformat()}T00:00:00",
+        "end":   f"{test_end.isoformat()}T23:59:59",
+        "bbox":  (f"{bbox['lat_min']:.4f},{bbox['lon_min']:.4f},"
+                  f"{bbox['lat_max']:.4f},{bbox['lon_max']:.4f}"),
+    }
+
+    result = {
+        "url":         requests.Request("GET", SWDI_BASE, params=params).prepare().url,
+        "status_code": None,
+        "raw_text":    "",
+        "columns":     [],
+        "row_count":   0,
+        "error":       None,
+    }
+
+    try:
+        resp = requests.get(SWDI_BASE, params=params, timeout=30)
+        result["status_code"] = resp.status_code
+        result["raw_text"] = resp.text[:1500]
+        resp.raise_for_status()
+
+        df = _parse_response(resp.text)
+        result["columns"]   = list(df.columns)
+        result["row_count"] = len(df)
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
+
+
+def _parse_response(text: str) -> pd.DataFrame:
+    """
+    Parse a raw SWDI CSV response, stripping leading comment/header lines
+    that begin with '#'.  Returns an empty DataFrame if no data rows exist.
+    """
+    if not text or not text.strip():
+        return pd.DataFrame()
+
+    lines = text.splitlines()
+
+    # Separate comment lines from data lines
+    data_lines = [ln for ln in lines if not ln.startswith("#")]
+
+    if len(data_lines) < 2:
+        # Only a header row (or nothing) — no actual strike records
+        return pd.DataFrame()
+
+    # Check for a "no data" indicator in comment lines
+    comment_text = " ".join(ln for ln in lines if ln.startswith("#")).lower()
+    if "no data" in comment_text or "no records" in comment_text:
+        return pd.DataFrame()
+
+    try:
+        return pd.read_csv(StringIO("\n".join(data_lines)))
+    except Exception:
+        return pd.DataFrame()
+
+
 def _fetch_chunk(start: date, end: date, bbox: dict) -> pd.DataFrame:
     """
     Fetch one date-range chunk from SWDI and return a raw DataFrame.
-    Returns an empty DataFrame on any error.
+    Raises RuntimeError on HTTP failure; returns empty DataFrame for no-data responses.
     """
     params = {
         "begin": f"{start.isoformat()}T00:00:00",
-        "end": f"{end.isoformat()}T23:59:59",
-        "bbox": f"{bbox['lat_min']:.4f},{bbox['lon_min']:.4f},{bbox['lat_max']:.4f},{bbox['lon_max']:.4f}",
+        "end":   f"{end.isoformat()}T23:59:59",
+        "bbox":  (f"{bbox['lat_min']:.4f},{bbox['lon_min']:.4f},"
+                  f"{bbox['lat_max']:.4f},{bbox['lon_max']:.4f}"),
     }
 
     try:
@@ -72,47 +142,45 @@ def _fetch_chunk(start: date, end: date, bbox: dict) -> pd.DataFrame:
     except requests.RequestException as exc:
         raise RuntimeError(f"NCEI SWDI request failed ({start} – {end}): {exc}") from exc
 
-    text = resp.text.strip()
-    if not text or text.startswith("#") or "no data" in text.lower():
-        return pd.DataFrame()
-
-    # Strip any comment lines that SWDI prepends
-    lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
-    if len(lines) < 2:
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(StringIO("\n".join(lines)))
-    except Exception:
-        return pd.DataFrame()
-
-    return df
+    return _parse_response(resp.text)
 
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalise SWDI column names — NCEI occasionally changes capitalisation
-    or spacing. Map everything to lowercase snake_case.
+    Normalise SWDI column names to lowercase snake_case and map to
+    standard internal names: timestamp_utc, latitude, longitude.
+
+    Known SWDI column names:
+      ZTIME  → timestamp_utc
+      LAT    → latitude
+      LON    → longitude
     """
-    rename = {}
-    for col in df.columns:
-        lo = col.strip().lower().replace(" ", "_").replace("-", "_")
-        rename[col] = lo
-    df = df.rename(columns=rename)
+    # Lowercase + strip
+    df.columns = [c.strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
 
-    # Identify timestamp column (could be 'ztime', 'datetime', 'date_time', ...)
-    ts_candidates = [c for c in df.columns if "time" in c or "date" in c]
-    if ts_candidates and "timestamp_utc" not in df.columns:
-        df = df.rename(columns={ts_candidates[0]: "timestamp_utc"})
+    # Timestamp: SWDI uses 'ztime' (UTC)
+    ts_map = {"ztime": "timestamp_utc", "datetime": "timestamp_utc",
+               "date_time": "timestamp_utc", "time": "timestamp_utc"}
+    for src, dst in ts_map.items():
+        if src in df.columns and "timestamp_utc" not in df.columns:
+            df = df.rename(columns={src: dst})
+    # Fallback: any column containing 'time' or 'date'
+    if "timestamp_utc" not in df.columns:
+        candidates = [c for c in df.columns if "time" in c or "date" in c]
+        if candidates:
+            df = df.rename(columns={candidates[0]: "timestamp_utc"})
 
-    # Identify lat / lon
-    for candidate, target in [
-        (["lat", "latitude"], "latitude"),
-        (["lon", "long", "longitude"], "longitude"),
-    ]:
-        matches = [c for c in df.columns if c in candidate]
-        if matches and target not in df.columns:
-            df = df.rename(columns={matches[0]: target})
+    # Latitude
+    lat_map = {"lat": "latitude", "latitude": "latitude"}
+    for src, dst in lat_map.items():
+        if src in df.columns and "latitude" not in df.columns:
+            df = df.rename(columns={src: dst})
+
+    # Longitude
+    lon_map = {"lon": "longitude", "long": "longitude", "longitude": "longitude"}
+    for src, dst in lon_map.items():
+        if src in df.columns and "longitude" not in df.columns:
+            df = df.rename(columns={src: dst})
 
     return df
 
@@ -127,35 +195,24 @@ def fetch_strikes(
     Fetch all cloud-to-ground lightning strikes within radius_miles of the
     Pueblo Chemical Depot for the given year range.
 
-    Parameters
-    ----------
-    start_year : int
-    end_year   : int  (inclusive)
-    radius_miles : float  — fetch bounding box sized for this radius; haversine
-                            filter applied afterwards.  Default 25 mi gives a
-                            comfortable buffer beyond the 20-mi shutdown trigger.
-    progress_callback : callable(current_chunk, total_chunks) | None
-
-    Returns
-    -------
-    pd.DataFrame with columns:
+    Returns a DataFrame with columns:
         timestamp_utc  (datetime64[ns, UTC])
         latitude       (float)
         longitude      (float)
-        distance_miles (float)   — great-circle distance from depot
+        distance_miles (float)
     """
     bbox = _bbox_for_radius(DEPOT_LAT, DEPOT_LON, radius_miles)
 
-    # Build list of monthly chunks
+    # Build monthly chunks
     chunks: list[tuple[date, date]] = []
-    current = date(start_year, 1, 1)
+    current  = date(start_year, 1, 1)
     end_date = date(end_year, 12, 31)
     while current <= end_date:
         chunk_end = min(current + timedelta(days=_CHUNK_DAYS - 1), end_date)
         chunks.append((current, chunk_end))
         current = chunk_end + timedelta(days=1)
 
-    total = len(chunks)
+    total  = len(chunks)
     frames: list[pd.DataFrame] = []
 
     for i, (chunk_start, chunk_end) in enumerate(chunks):
@@ -177,7 +234,6 @@ def fetch_strikes(
     df = pd.concat(frames, ignore_index=True)
     df = _normalise_columns(df)
 
-    # Require usable columns
     required = {"timestamp_utc", "latitude", "longitude"}
     if not required.issubset(df.columns):
         missing = required - set(df.columns)
@@ -186,22 +242,21 @@ def fetch_strikes(
             f"Columns found: {list(df.columns)}"
         )
 
-    # Parse and localise timestamp
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-    df = df.dropna(subset=["timestamp_utc", "latitude", "longitude"])
+    df = df.dropna(subset=["timestamp_utc"])
 
-    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df = df.dropna(subset=["latitude", "longitude"])
 
-    # Haversine filter — keep only strikes within the requested radius
     df["distance_miles"] = df.apply(
         lambda r: haversine_miles(DEPOT_LAT, DEPOT_LON, r["latitude"], r["longitude"]),
         axis=1,
     )
     df = df[df["distance_miles"] <= radius_miles].copy()
 
-    df = df[["timestamp_utc", "latitude", "longitude", "distance_miles"]].sort_values("timestamp_utc")
-    df = df.reset_index(drop=True)
-
-    return df
+    return (
+        df[["timestamp_utc", "latitude", "longitude", "distance_miles"]]
+        .sort_values("timestamp_utc")
+        .reset_index(drop=True)
+    )

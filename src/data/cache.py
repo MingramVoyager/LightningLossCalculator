@@ -1,15 +1,18 @@
 """
 Local parquet cache for downloaded SWDI lightning data.
 
-Cache files are keyed by year and stored under the /data directory at the
-repo root.  Cached files are excluded from git via .gitignore.
+Cache files are keyed by year and stored in the system temp directory so
+writes succeed on both local machines and read-only cloud environments
+(Streamlit Community Cloud mounts the repo as read-only).
 """
 
+import tempfile
 from pathlib import Path
 
 import pandas as pd
 
-_CACHE_DIR = Path(__file__).resolve().parents[2] / "data"
+# Use the OS temp directory — writable on all platforms including Streamlit Cloud
+_CACHE_DIR = Path(tempfile.gettempdir()) / "lightning_loss_cache"
 
 
 def cache_path(year: int) -> Path:
@@ -33,6 +36,7 @@ def load(year: int) -> pd.DataFrame:
 
 
 def save(year: int, df: pd.DataFrame) -> None:
+    _CACHE_DIR.mkdir(exist_ok=True)
     df.to_parquet(cache_path(year), index=False)
 
 
@@ -51,3 +55,8 @@ def cached_years() -> list[int]:
         except (IndexError, ValueError):
             pass
     return sorted(years)
+
+
+def cache_dir() -> Path:
+    """Return the cache directory path (for display purposes)."""
+    return _CACHE_DIR

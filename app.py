@@ -101,10 +101,31 @@ with tab_data:
     st.markdown(
         "Data is fetched from the **NOAA NCEI Severe Weather Data Inventory (SWDI)** "
         "which provides cloud-to-ground strike locations from the Vaisala National "
-        "Lightning Detection Network (NLDN).  Downloaded data is cached locally so "
-        "repeated runs are instant."
+        "Lightning Detection Network (NLDN).  Downloaded data is cached in the system "
+        "temp directory so repeated runs within the same session are instant."
     )
+    st.caption(f"Cache location: `{cache.cache_dir()}`")
 
+    # ── API Diagnostic ────────────────────────────────────────────────────────
+    with st.expander("🔬 API Diagnostic — test connection before fetching"):
+        st.caption("Makes a small 3-day request to verify the NCEI SWDI API is reachable and returning expected data.")
+        if st.button("Run API Test"):
+            with st.spinner("Probing NCEI SWDI…"):
+                probe = ncei_client.probe_api(days=3)
+
+            st.write(f"**URL called:** `{probe['url']}`")
+            st.write(f"**HTTP status:** {probe['status_code']}")
+
+            if probe["error"]:
+                st.error(f"Error: {probe['error']}")
+            else:
+                st.success(f"OK — {probe['row_count']} strike records returned, columns: `{probe['columns']}`")
+
+            st.text_area("Raw response (first 1500 chars)", probe["raw_text"], height=200)
+
+    st.divider()
+
+    # ── Fetch / cache ─────────────────────────────────────────────────────────
     cached = cache.cached_years()
     needed = list(range(start_year, end_year + 1))
     missing = [y for y in needed if y not in cached]
@@ -114,54 +135,67 @@ with tab_data:
         if missing:
             st.info(f"Years not yet cached: **{', '.join(str(y) for y in missing)}**")
         else:
-            st.success(f"All {len(needed)} years cached locally.")
+            st.success(f"All {len(needed)} years cached.")
     with col_fetch:
         fetch_clicked = st.button("⬇ Fetch / Refresh", type="primary", use_container_width=True)
 
     if fetch_clicked:
         fetch_years = missing if missing else needed
         progress_bar = st.progress(0.0, text="Starting…")
+        status_box   = st.empty()
         errors = []
 
         for yi, year in enumerate(fetch_years):
-            # Monthly chunks within each year
-            total_chunks = 12  # approximate
-
             def _progress(chunk, total, _year=year, _yi=yi, _fetch_years=fetch_years):
                 frac = (_yi + (chunk / max(total, 1))) / len(_fetch_years)
-                progress_bar.progress(frac, text=f"Fetching {_year} ({chunk}/{total} chunks)…")
+                progress_bar.progress(
+                    min(frac, 1.0),
+                    text=f"Fetching {_year} — chunk {chunk}/{total}…"
+                )
 
             try:
-                df_year = ncei_client.fetch_strikes(year, year, radius_miles=float(warn_miles) + 5,
-                                                     progress_callback=_progress)
+                status_box.info(f"Fetching {year}…")
+                df_year = ncei_client.fetch_strikes(
+                    year, year,
+                    radius_miles=float(warn_miles) + 5,
+                    progress_callback=_progress,
+                )
                 cache.save(year, df_year)
+                status_box.success(f"{year}: {len(df_year):,} strike records cached.")
             except Exception as exc:
                 errors.append(f"{year}: {exc}")
+                status_box.error(f"{year} failed: {exc}")
 
         progress_bar.progress(1.0, text="Done.")
         if errors:
-            st.error("Some years failed:\n" + "\n".join(errors))
+            st.error("Errors during fetch:\n" + "\n".join(errors))
         else:
-            st.success("Fetch complete. Cached years: " + ", ".join(str(y) for y in cache.cached_years()))
+            st.success("All years fetched. Cached: " + ", ".join(str(y) for y in cache.cached_years()))
         st.rerun()
 
-    # Show cache summary table
+    # ── Cache summary table ───────────────────────────────────────────────────
+    cached = cache.cached_years()   # re-read after possible fetch
     if cached:
         st.subheader("Cached Data Summary")
         rows = []
         for y in sorted(cached):
             try:
                 df_y = cache.load(y)
-                rows.append({"Year": y, "Strike records": f"{len(df_y):,}",
-                             "Min distance (mi)": f"{df_y['distance_miles'].min():.1f}" if not df_y.empty else "—"})
-            except Exception:
-                rows.append({"Year": y, "Strike records": "error", "Min distance (mi)": "—"})
+                rows.append({
+                    "Year": y,
+                    "Strike records": f"{len(df_y):,}",
+                    "Min distance (mi)": f"{df_y['distance_miles'].min():.1f}" if not df_y.empty else "—",
+                })
+            except Exception as e:
+                rows.append({"Year": y, "Strike records": f"load error: {e}", "Min distance (mi)": "—"})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No data cached yet. Click **Fetch / Refresh** above.")
 
-    # Run analysis button
+    # ── Run analysis ──────────────────────────────────────────────────────────
     st.divider()
     st.subheader("Run Analysis")
-    st.caption("Loads cached data for the selected year range and applies the shutdown rules configured in the sidebar.")
+    st.caption("Loads cached data for the selected year range and applies the shutdown rules from the sidebar.")
     run_clicked = st.button("▶ Run Analysis", type="primary")
 
     if run_clicked:
@@ -174,7 +208,7 @@ with tab_data:
                     except Exception as e:
                         st.warning(f"Could not load {year}: {e}")
                 else:
-                    st.warning(f"{year} not cached — skipping. Use Fetch above.")
+                    st.warning(f"{year} not cached — skipping. Fetch it above first.")
 
             if frames:
                 all_strikes = pd.concat(frames, ignore_index=True)
@@ -187,9 +221,9 @@ with tab_data:
                     end_hour=int(end_hour),
                 )
                 st.session_state.daily_loss = daily
-                st.success(f"Analysis complete. {len(daily):,} days with lightning-related downtime.")
+                st.success(f"Analysis complete — {len(daily):,} days with lightning-related downtime.")
             else:
-                st.error("No cached data available for the selected years.")
+                st.error("No cached data available for the selected years. Fetch data first.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
