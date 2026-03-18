@@ -11,95 +11,106 @@ Why this works for the analysis:
     at the airport is definitively within both the 15-mile and 20-mile
     shutdown thresholds.
   • The 30-minute clear rule is applied by the shutdown engine as normal.
-  • Resolution is hourly (one observation per hour), so the minimum
-    detectable event is ~1 hour.  This is a slight conservative overestimate
-    but appropriate for a multi-year downtime analysis.
+  • Resolution is hourly; minimum detectable event is ~1 hour.
 
 Limitation vs NLDN strike data:
-  • Cannot resolve storms at exactly 15-vs-20 miles (both thresholds are
-    always triggered when a TS is observed at KPUB).
-  • Storms that approach within 20 miles but never reach the airport may be
-    missed.  In practice, Pueblo is small and storms at 20 miles are often
-    visible to the airport sensors.
+  • Cannot resolve storms at exactly 15-vs-20 miles.
+  • Conservative estimate: any thunderstorm at KPUB = shutdown.
 
-NCEI ADS endpoint:
-  https://www.ncei.noaa.gov/access/services/data/v1
-  dataset: global-hourly
-  station: 72465023058  (KPUB — Pueblo Memorial Airport)
+Station lookup:
+  Station IDs are resolved from the NCEI ISD history file at startup so
+  we always use the correct USAF+WBAN regardless of format changes.
+
+Station ID format for NCEI ADS:
+  The global-hourly dataset requires USAF-WBAN with a hyphen, e.g.
+  "724640-23058".  The 11-digit concatenated form (no hyphen) returns
+  HTTP 200 but zero rows.
 """
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from io import StringIO
 
 import pandas as pd
 import requests
 
-NCEI_ADS_BASE = "https://www.ncei.noaa.gov/access/services/data/v1"
+NCEI_ADS_BASE   = "https://www.ncei.noaa.gov/access/services/data/v1"
+ISD_HISTORY_URL = "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
 
-# KPUB — Pueblo Memorial Airport
-# ISD station IDs = USAF (6 digits) + WBAN (5 digits).
-# WBAN for KPUB is confirmed as 23058; USAF candidates to try in order:
-KPUB_STATION_CANDIDATES = [
-    "72464023058",  # USAF 724640 — most likely correct
-    "72465023058",  # USAF 724650 — previously tried, returned no rows
-    "72466023058",  # USAF 724660 — additional candidate
-    "KPUB",         # ICAO code — accepted by some NCEI endpoints
-]
-KPUB_STATION   = KPUB_STATION_CANDIDATES[0]   # updated after probe confirms
-KPUB_LAT       = 38.2890
-KPUB_LON       = -104.4970
-KPUB_DIST_MI   = 3.0   # approximate distance from depot
+KPUB_ICAO    = "KPUB"
+KPUB_LAT     = 38.2890
+KPUB_LON     = -104.4970
+KPUB_DIST_MI = 3.0
 
-_CHUNK_DAYS    = 90    # ISD queries are lighter; use 90-day chunks
+_CHUNK_DAYS    = 90
 _REQUEST_PAUSE = 0.5
 
 
-# ── Present-weather thunderstorm detection ────────────────────────────────────
-# ISD encodes present weather in several compound fields.
-# Thunderstorm WMO descriptors observed in ISD CSV:
-#   MW field codes that indicate TS:  17, 29, 91-99
-#   METAR strings that indicate TS:   "TS", "TSRA", "TSGR", etc.
-# We scan every field in the row for these patterns.
+# ── Station ID lookup ─────────────────────────────────────────────────────────
 
-_TS_WMO_CODES = {"17", "29", "91", "92", "93", "94", "95", "96", "97", "98", "99"}
-_TS_METAR_SUBSTRINGS = ("TS",)   # "TS" appears in TSRA, TSGR, TSPL, etc.
-
-
-def _row_has_thunderstorm(row: pd.Series) -> bool:
+def lookup_station_id(icao: str) -> tuple[str | None, str | None, str]:
     """
-    Return True if any column in the ISD row contains a thunderstorm indicator.
-    Checks WMO numeric codes (MW/AW fields) and METAR substrings.
+    Look up the NCEI ISD station for an ICAO call sign by fetching
+    isd-history.csv.  Returns (usaf, wban, status_message).
+
+    The returned usaf and wban are zero-padded strings (6 and 5 chars).
+    If multiple rows match, the one with the most recent END date is used.
+    If lookup fails, usaf and wban are None.
     """
-    for col, val in row.items():
-        if pd.isna(val):
-            continue
-        s = str(val).strip()
-        if not s or s in ("nan", "None", "9", "99999", "999999"):
-            continue
+    try:
+        resp = requests.get(ISD_HISTORY_URL, timeout=60)
+        resp.raise_for_status()
+    except Exception as exc:
+        return None, None, f"Failed to fetch ISD history: {exc}"
 
-        col_lo = col.lower()
+    try:
+        df = pd.read_csv(StringIO(resp.text), dtype=str)
+    except Exception as exc:
+        return None, None, f"Failed to parse ISD history: {exc}"
 
-        # MW/AW columns contain comma-separated WMO codes like "17,1" or "95,1"
-        if col_lo.startswith(("mw", "aw")):
-            code = s.split(",")[0].strip()
-            if code in _TS_WMO_CODES:
-                return True
+    # Locate the call-sign column
+    call_col = next(
+        (c for c in df.columns if c.strip().upper() in ("CALL", "CALL_SIGN", "ICAO")),
+        None,
+    )
+    if call_col is None:
+        return None, None, f"No CALL column found. Columns: {list(df.columns)}"
 
-        # REM (remark) and any METAR-like field may contain "TS" substring
-        if any(sub in s for sub in _TS_METAR_SUBSTRINGS):
-            # Avoid false positives like "DIST" or "LAST"
-            import re
-            if re.search(r'\bTS\b|TS[A-Z]', s):
-                return True
+    df[call_col] = df[call_col].astype(str).str.strip().str.upper()
+    match = df[df[call_col] == icao.upper()].copy()
 
-    return False
+    if match.empty:
+        return None, None, f"No ISD station found for ICAO '{icao}'."
+
+    # Most-recent END date first
+    if "END" in match.columns:
+        match["END"] = pd.to_numeric(match["END"], errors="coerce")
+        match = match.sort_values("END", ascending=False)
+
+    row = match.iloc[0]
+    try:
+        usaf = str(int(float(row["USAF"]))).zfill(6)
+        wban = str(int(float(row["WBAN"]))).zfill(5)
+    except Exception as exc:
+        return None, None, f"Could not parse USAF/WBAN: {dict(row)} — {exc}"
+
+    name = str(row.get("STATION NAME", row.get("STATION_NAME", ""))).strip()
+    lat  = row.get("LAT", "")
+    lon  = row.get("LON", "")
+    end  = row.get("END", "")
+    msg  = (f"{name} | USAF {usaf}  WBAN {wban} | "
+            f"Lat {lat}  Lon {lon} | Active through {end}")
+    return usaf, wban, msg
 
 
-# ── API fetch ─────────────────────────────────────────────────────────────────
+def _station_param(usaf: str, wban: str) -> str:
+    """Format the station ID as required by NCEI ADS: 'USAF-WBAN'."""
+    return f"{usaf}-{wban}"
+
+
+# ── CSV helpers ───────────────────────────────────────────────────────────────
 
 def _parse_raw_csv(text: str) -> pd.DataFrame:
-    """Parse a raw NCEI ADS CSV response into a DataFrame."""
     if not text or not text.strip():
         return pd.DataFrame()
     lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
@@ -111,10 +122,10 @@ def _parse_raw_csv(text: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _fetch_chunk(start: date, end: date) -> pd.DataFrame:
+def _fetch_chunk(station_param: str, start: date, end: date) -> pd.DataFrame:
     params = {
         "dataset":   "global-hourly",
-        "stations":  KPUB_STATION,
+        "stations":  station_param,
         "startDate": start.isoformat(),
         "endDate":   end.isoformat(),
         "format":    "csv",
@@ -127,46 +138,53 @@ def _fetch_chunk(start: date, end: date) -> pd.DataFrame:
     return _parse_raw_csv(resp.text)
 
 
+# ── Present-weather thunderstorm detection ────────────────────────────────────
+
+_TS_WMO_CODES        = {"17","29","91","92","93","94","95","96","97","98","99"}
+_TS_METAR_SUBSTRINGS = ("TS",)
+
+
+def _row_has_thunderstorm(row: pd.Series) -> bool:
+    import re
+    for col, val in row.items():
+        if pd.isna(val):
+            continue
+        s = str(val).strip()
+        if not s or s in ("nan", "None", "9", "99999", "999999"):
+            continue
+        col_lo = col.lower()
+        if col_lo.startswith(("mw", "aw", "au")):
+            code = s.split(",")[0].strip()
+            if code in _TS_WMO_CODES:
+                return True
+        if any(sub in s for sub in _TS_METAR_SUBSTRINGS):
+            if re.search(r'\bTS\b|TS[A-Z]', s):
+                return True
+    return False
+
+
 def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filter raw ISD observations to rows that contain a thunderstorm indicator.
-    Returns DataFrame with columns: timestamp_utc, distance_miles.
-    """
     if raw.empty:
         return pd.DataFrame(columns=["timestamp_utc", "distance_miles"])
 
-    # Identify timestamp column
-    date_col = None
-    for c in raw.columns:
-        if c.upper() in ("DATE", "DATETIME", "DATE_TIME", "TIMESTAMP"):
-            date_col = c
-            break
+    date_col = next(
+        (c for c in raw.columns if c.strip().upper() in ("DATE", "DATETIME", "DATE_TIME", "TIMESTAMP")),
+        None,
+    )
     if date_col is None:
-        date_cols = [c for c in raw.columns if "date" in c.lower() or "time" in c.lower()]
-        date_col = date_cols[0] if date_cols else None
-
+        candidates = [c for c in raw.columns if "date" in c.lower() or "time" in c.lower()]
+        date_col = candidates[0] if candidates else None
     if date_col is None:
         return pd.DataFrame(columns=["timestamp_utc", "distance_miles"])
-
-    # Keep METAR / ASOS reports only (skip special/synoptic types if present)
-    report_cols = [c for c in raw.columns if "report" in c.lower() or "type" in c.lower()]
-    if report_cols:
-        rc = report_cols[0]
-        raw = raw[raw[rc].astype(str).str.contains("FM-15|FM-16|METAR|ASOS", na=False, regex=True)]
-        if raw.empty:
-            # Fallback: keep all rows
-            pass
 
     ts_mask = raw.apply(_row_has_thunderstorm, axis=1)
     ts_rows  = raw[ts_mask].copy()
-
     if ts_rows.empty:
         return pd.DataFrame(columns=["timestamp_utc", "distance_miles"])
 
-    ts_rows["timestamp_utc"] = pd.to_datetime(ts_rows[date_col], utc=True, errors="coerce")
-    ts_rows = ts_rows.dropna(subset=["timestamp_utc"])
+    ts_rows["timestamp_utc"]  = pd.to_datetime(ts_rows[date_col], utc=True, errors="coerce")
+    ts_rows                   = ts_rows.dropna(subset=["timestamp_utc"])
     ts_rows["distance_miles"] = KPUB_DIST_MI
-
     return ts_rows[["timestamp_utc", "distance_miles"]].reset_index(drop=True)
 
 
@@ -174,99 +192,87 @@ def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
 
 def probe_api() -> dict:
     """
-    Try each KPUB station ID candidate against a 5-day July 2023 window
-    and return diagnostic info for all candidates so we can identify which
-    station ID actually has records in the NCEI database.
+    Step 1: resolve KPUB station ID from isd-history.csv.
+    Step 2: fetch a 5-day July 2023 test window with both ID formats.
+    Returns full diagnostic info.
     """
-    test_start = date(2023, 7, 4)
-    test_end   = date(2023, 7, 8)
-
-    candidates = []
-    working_station = None
-
-    for station_id in KPUB_STATION_CANDIDATES:
-        params = {
-            "dataset":   "global-hourly",
-            "stations":  station_id,
-            "startDate": test_start.isoformat(),
-            "endDate":   test_end.isoformat(),
-            "format":    "csv",
-        }
-        req = requests.Request("GET", NCEI_ADS_BASE, params=params).prepare()
-        entry = {
-            "station_id":  station_id,
-            "url":         req.url,
-            "status_code": None,
-            "row_count":   0,
-            "ts_hours":    0,
-            "error":       None,
-        }
-        try:
-            resp = requests.get(NCEI_ADS_BASE, params=params, timeout=30)
-            entry["status_code"] = resp.status_code
-            resp.raise_for_status()
-            raw = _parse_raw_csv(resp.text)
-            entry["row_count"] = len(raw)
-            if not raw.empty:
-                ts = _parse_ts_hours(raw)
-                entry["ts_hours"] = len(ts)
-                if working_station is None:
-                    working_station = station_id
-        except Exception as exc:
-            entry["error"] = str(exc)
-        candidates.append(entry)
-        time.sleep(0.5)
-
-    # Use the first candidate that returned rows for the main result display
-    first_working = next((c for c in candidates if c["row_count"] > 0), None)
-    if first_working:
-        params_w = {
-            "dataset":   "global-hourly",
-            "stations":  first_working["station_id"],
-            "startDate": test_start.isoformat(),
-            "endDate":   test_end.isoformat(),
-            "format":    "csv",
-        }
-        resp_w = requests.get(NCEI_ADS_BASE, params=params_w, timeout=30)
-        raw_text = resp_w.text[:2500]
-        raw      = _parse_raw_csv(resp_w.text)
-        columns  = list(raw.columns)
-        ts       = _parse_ts_hours(raw)
-    else:
-        raw_text = ""
-        columns  = []
-        ts       = pd.DataFrame()
-
-    return {
-        "candidates":    candidates,
-        "working_station": working_station,
-        "url":           candidates[0]["url"],
-        "raw_text":      raw_text,
-        "columns":       columns,
-        "row_count":     first_working["row_count"] if first_working else 0,
-        "ts_hours":      len(ts) if first_working else 0,
-        "error":         None if first_working else "No station ID returned data.",
+    result = {
+        "usaf":         None,
+        "wban":         None,
+        "station_id":   None,   # hyphenated USAF-WBAN
+        "station_msg":  "",
+        "url":          "",
+        "status_code":  None,
+        "raw_text":     "",
+        "columns":      [],
+        "row_count":    0,
+        "ts_hours":     0,
+        "error":        None,
     }
+
+    # Step 1 — resolve station ID
+    usaf, wban, msg = lookup_station_id(KPUB_ICAO)
+    result["station_msg"] = msg
+
+    if usaf is None:
+        result["error"] = msg
+        return result
+
+    result["usaf"]       = usaf
+    result["wban"]       = wban
+    result["station_id"] = f"{usaf}-{wban}"
+
+    # Step 2 — test fetch with the hyphenated station ID
+    test_start  = date(2023, 7, 4)
+    test_end    = date(2023, 7, 8)
+    station_param = _station_param(usaf, wban)
+    params = {
+        "dataset":   "global-hourly",
+        "stations":  station_param,
+        "startDate": test_start.isoformat(),
+        "endDate":   test_end.isoformat(),
+        "format":    "csv",
+    }
+    req = requests.Request("GET", NCEI_ADS_BASE, params=params).prepare()
+    result["url"] = req.url
+
+    try:
+        resp = requests.get(NCEI_ADS_BASE, params=params, timeout=30)
+        result["status_code"] = resp.status_code
+        result["raw_text"]    = resp.text[:2500]
+        resp.raise_for_status()
+
+        raw = _parse_raw_csv(resp.text)
+        result["columns"]   = list(raw.columns)
+        result["row_count"] = len(raw)
+
+        ts = _parse_ts_hours(raw)
+        result["ts_hours"] = len(ts)
+
+    except Exception as exc:
+        result["error"] = str(exc)
+
+    return result
 
 
 # ── Public fetch entry point ──────────────────────────────────────────────────
 
 def fetch_strikes(
     start_year: int,
-    end_year: int,
-    radius_miles: float = 25.0,   # accepted for API compatibility; not used (KPUB is fixed)
+    end_year:   int,
+    radius_miles: float = 25.0,
     progress_callback=None,
 ) -> pd.DataFrame:
     """
-    Fetch KPUB thunderstorm hours for the given year range and return them
-    as synthetic strike records usable by the shutdown engine.
-
-    Each thunderstorm observation hour becomes a synthetic strike at
-    KPUB_DIST_MI from the depot, so the existing proximity rules fire
-    as expected.
-
-    Returns DataFrame: timestamp_utc (UTC), latitude, longitude, distance_miles
+    Fetch KPUB thunderstorm hours for the given year range.
+    Station ID is resolved from isd-history.csv on every call.
     """
+    usaf, wban, msg = lookup_station_id(KPUB_ICAO)
+    if usaf is None:
+        raise RuntimeError(f"Could not resolve KPUB station ID: {msg}")
+
+    station_param = _station_param(usaf, wban)
+
     chunks: list[tuple[date, date]] = []
     current  = date(start_year, 1, 1)
     end_date = date(end_year, 12, 31)
@@ -281,12 +287,10 @@ def fetch_strikes(
     for i, (chunk_start, chunk_end) in enumerate(chunks):
         if progress_callback:
             progress_callback(i, total)
-
-        raw = _fetch_chunk(chunk_start, chunk_end)
+        raw = _fetch_chunk(station_param, chunk_start, chunk_end)
         ts  = _parse_ts_hours(raw)
         if not ts.empty:
             frames.append(ts)
-
         time.sleep(_REQUEST_PAUSE)
 
     if progress_callback:

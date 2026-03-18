@@ -129,8 +129,10 @@ with tab_data:
             st.subheader("Station ID Lookup")
             station_id  = probe.get("station_id")
             station_msg = probe.get("station_msg", "")
+            usaf        = probe.get("usaf")
+            wban        = probe.get("wban")
             if station_id:
-                st.success(f"✅ Resolved station ID: **{station_id}**")
+                st.success(f"✅ Resolved: USAF **{usaf}**  WBAN **{wban}**  →  API param **{station_id}**")
                 st.caption(station_msg)
             else:
                 st.error(f"Could not resolve station ID: {station_msg or probe.get('error', 'unknown error')}")
