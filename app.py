@@ -117,22 +117,38 @@ with tab_data:
             "to confirm the NCEI endpoint is reachable and thunderstorm parsing is working."
         )
         if st.button("Run API Test"):
-            with st.spinner("Probing NCEI ISD for KPUB…"):
+            with st.spinner("Probing NCEI ISD — trying all station ID candidates…"):
                 probe = isd_client.probe_api()
 
-            st.write(f"**URL:** `{probe['url']}`")
-            st.write(f"**HTTP status:** `{probe['status_code']}`")
+            # Per-candidate results
+            st.subheader("Station ID Candidates")
+            cand_rows = []
+            for c in probe["candidates"]:
+                cand_rows.append({
+                    "Station ID":   c["station_id"],
+                    "HTTP Status":  c["status_code"],
+                    "Obs Rows":     c["row_count"],
+                    "TS Hours":     c["ts_hours"],
+                    "Error":        c["error"] or "",
+                })
+            st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
 
-            if probe["error"]:
-                st.error(f"Error: {probe['error']}")
-            else:
+            if probe["working_station"]:
                 st.success(
-                    f"✅ {probe['row_count']} hourly observations — "
-                    f"**{probe['ts_hours']} thunderstorm hours** detected in the test window."
+                    f"✅ Working station ID: **{probe['working_station']}** — "
+                    f"{probe['row_count']} observations, {probe['ts_hours']} thunderstorm hours "
+                    f"in the July 4–8 2023 test window."
                 )
-                st.write(f"Columns returned: `{probe['columns']}`")
+                st.write(f"Columns: `{probe['columns']}`")
+            else:
+                st.error(
+                    "No station ID returned data. Check the raw response below and "
+                    "look up the correct USAF+WBAN at "
+                    "ncei.noaa.gov/pub/data/noaa/isd-history.csv (search KPUB)."
+                )
 
-            st.text_area("Raw response (first 2500 chars)", probe["raw_text"], height=220)
+            st.text_area("Raw response from first working candidate (first 2500 chars)",
+                         probe["raw_text"], height=220)
 
     st.divider()
 

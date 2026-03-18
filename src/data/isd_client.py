@@ -38,7 +38,15 @@ import requests
 NCEI_ADS_BASE = "https://www.ncei.noaa.gov/access/services/data/v1"
 
 # KPUB — Pueblo Memorial Airport
-KPUB_STATION   = "72465023058"
+# ISD station IDs = USAF (6 digits) + WBAN (5 digits).
+# WBAN for KPUB is confirmed as 23058; USAF candidates to try in order:
+KPUB_STATION_CANDIDATES = [
+    "72464023058",  # USAF 724640 — most likely correct
+    "72465023058",  # USAF 724650 — previously tried, returned no rows
+    "72466023058",  # USAF 724660 — additional candidate
+    "KPUB",         # ICAO code — accepted by some NCEI endpoints
+]
+KPUB_STATION   = KPUB_STATION_CANDIDATES[0]   # updated after probe confirms
 KPUB_LAT       = 38.2890
 KPUB_LON       = -104.4970
 KPUB_DIST_MI   = 3.0   # approximate distance from depot
@@ -90,6 +98,19 @@ def _row_has_thunderstorm(row: pd.Series) -> bool:
 
 # ── API fetch ─────────────────────────────────────────────────────────────────
 
+def _parse_raw_csv(text: str) -> pd.DataFrame:
+    """Parse a raw NCEI ADS CSV response into a DataFrame."""
+    if not text or not text.strip():
+        return pd.DataFrame()
+    lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
+    if len(lines) < 2:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(StringIO("\n".join(lines)), low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+
+
 def _fetch_chunk(start: date, end: date) -> pd.DataFrame:
     params = {
         "dataset":   "global-hourly",
@@ -103,19 +124,7 @@ def _fetch_chunk(start: date, end: date) -> pd.DataFrame:
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise RuntimeError(f"NCEI ISD request failed ({start}–{end}): {exc}") from exc
-
-    text = resp.text.strip()
-    if not text:
-        return pd.DataFrame()
-
-    lines = [ln for ln in text.splitlines() if not ln.startswith("#")]
-    if len(lines) < 2:
-        return pd.DataFrame()
-
-    try:
-        return pd.read_csv(StringIO("\n".join(lines)), low_memory=False)
-    except Exception:
-        return pd.DataFrame()
+    return _parse_raw_csv(resp.text)
 
 
 def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
@@ -165,47 +174,79 @@ def _parse_ts_hours(raw: pd.DataFrame) -> pd.DataFrame:
 
 def probe_api() -> dict:
     """
-    Fetch 5 days of ISD data from KPUB (July 4-8, 2023 — peak CO storm season)
-    and return diagnostic info.
+    Try each KPUB station ID candidate against a 5-day July 2023 window
+    and return diagnostic info for all candidates so we can identify which
+    station ID actually has records in the NCEI database.
     """
     test_start = date(2023, 7, 4)
     test_end   = date(2023, 7, 8)
-    params = {
-        "dataset":   "global-hourly",
-        "stations":  KPUB_STATION,
-        "startDate": test_start.isoformat(),
-        "endDate":   test_end.isoformat(),
-        "format":    "csv",
+
+    candidates = []
+    working_station = None
+
+    for station_id in KPUB_STATION_CANDIDATES:
+        params = {
+            "dataset":   "global-hourly",
+            "stations":  station_id,
+            "startDate": test_start.isoformat(),
+            "endDate":   test_end.isoformat(),
+            "format":    "csv",
+        }
+        req = requests.Request("GET", NCEI_ADS_BASE, params=params).prepare()
+        entry = {
+            "station_id":  station_id,
+            "url":         req.url,
+            "status_code": None,
+            "row_count":   0,
+            "ts_hours":    0,
+            "error":       None,
+        }
+        try:
+            resp = requests.get(NCEI_ADS_BASE, params=params, timeout=30)
+            entry["status_code"] = resp.status_code
+            resp.raise_for_status()
+            raw = _parse_raw_csv(resp.text)
+            entry["row_count"] = len(raw)
+            if not raw.empty:
+                ts = _parse_ts_hours(raw)
+                entry["ts_hours"] = len(ts)
+                if working_station is None:
+                    working_station = station_id
+        except Exception as exc:
+            entry["error"] = str(exc)
+        candidates.append(entry)
+        time.sleep(0.5)
+
+    # Use the first candidate that returned rows for the main result display
+    first_working = next((c for c in candidates if c["row_count"] > 0), None)
+    if first_working:
+        params_w = {
+            "dataset":   "global-hourly",
+            "stations":  first_working["station_id"],
+            "startDate": test_start.isoformat(),
+            "endDate":   test_end.isoformat(),
+            "format":    "csv",
+        }
+        resp_w = requests.get(NCEI_ADS_BASE, params=params_w, timeout=30)
+        raw_text = resp_w.text[:2500]
+        raw      = _parse_raw_csv(resp_w.text)
+        columns  = list(raw.columns)
+        ts       = _parse_ts_hours(raw)
+    else:
+        raw_text = ""
+        columns  = []
+        ts       = pd.DataFrame()
+
+    return {
+        "candidates":    candidates,
+        "working_station": working_station,
+        "url":           candidates[0]["url"],
+        "raw_text":      raw_text,
+        "columns":       columns,
+        "row_count":     first_working["row_count"] if first_working else 0,
+        "ts_hours":      len(ts) if first_working else 0,
+        "error":         None if first_working else "No station ID returned data.",
     }
-    req = requests.Request("GET", NCEI_ADS_BASE, params=params).prepare()
-
-    result = {
-        "url":         req.url,
-        "status_code": None,
-        "raw_text":    "",
-        "columns":     [],
-        "row_count":   0,
-        "ts_hours":    0,
-        "error":       None,
-    }
-
-    try:
-        resp = requests.get(NCEI_ADS_BASE, params=params, timeout=30)
-        result["status_code"] = resp.status_code
-        result["raw_text"]    = resp.text[:2500]
-        resp.raise_for_status()
-
-        raw = _fetch_chunk(test_start, test_end)
-        result["columns"]   = list(raw.columns)
-        result["row_count"] = len(raw)
-
-        ts = _parse_ts_hours(raw)
-        result["ts_hours"] = len(ts)
-
-    except Exception as exc:
-        result["error"] = str(exc)
-
-    return result
 
 
 # ── Public fetch entry point ──────────────────────────────────────────────────
